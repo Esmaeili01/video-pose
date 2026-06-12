@@ -1,6 +1,10 @@
 import sys
 import cv2
 import time
+from PyQt6.QtWidgets import (QApplication, QLabel, QVBoxLayout, QWidget, QComboBox, 
+                             QPushButton, QSlider, QHBoxLayout)
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QImage, QPixmap
 
 # --- FORCE REGISTRY UNIFICATION ---
 from mmengine.registry import TRANSFORMS
@@ -16,10 +20,6 @@ from mmpose.apis import inference_topdown, init_model
 from mmpose.visualization import PoseLocalVisualizer
 from mmpose.structures import merge_data_samples
 
-from PyQt6.QtWidgets import (QApplication, QLabel, QVBoxLayout, QWidget, QComboBox)
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QImage, QPixmap
-
 # --- CONFIG ---
 DET_CONFIG = 'detection/rtmdet_nano.py'
 DET_CHECKPOINT = 'detection/rtmdet_nano_8xb32-100e_coco-obj365-person-05d8511e.pth'
@@ -34,36 +34,43 @@ MODELS = {
 class PoseApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RTMPose Multi-Person WholeBody")
+        self.setWindowTitle("RTMPose Multi-Person Control")
+        
+        # Detector
         self.detector = init_detector(DET_CONFIG, DET_CHECKPOINT, device='cpu')
+        self.cap = cv2.VideoCapture(VIDEO_PATH)
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
         
+        # UI Layout
         layout = QVBoxLayout()
-        
-        # Model Selector
         self.combo = QComboBox()
         self.combo.addItems(MODELS.keys())
         self.combo.currentTextChanged.connect(self.load_model)
-        layout.addWidget(QLabel("Select Model:"))
-        layout.addWidget(self.combo)
+        layout.addWidget(QLabel("Select Model:")); layout.addWidget(self.combo)
         
-        # Video Display
-        self.video_label = QLabel("Initializing...")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.video_label)
+        self.video_label = QLabel("Loading..."); layout.addWidget(self.video_label)
         
-        # Stats Display
-        self.stats_label = QLabel("Stats: Loading...")
-        self.stats_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.stats_label.setStyleSheet("font-weight: bold; font-size: 14px; color: blue;")
-        layout.addWidget(self.stats_label)
+        # Controls
+        ctrl_layout = QHBoxLayout()
+        self.btn_play = QPushButton("Play/Pause"); self.btn_play.clicked.connect(self.toggle_play)
+        self.btn_reset = QPushButton("Start Over"); self.btn_reset.clicked.connect(self.reset_video)
+        ctrl_layout.addWidget(self.btn_play); ctrl_layout.addWidget(self.btn_reset)
+        layout.addLayout(ctrl_layout)
         
+        self.progress_bar = QSlider(Qt.Orientation.Horizontal); self.progress_bar.setRange(0, self.total_frames)
+        layout.addWidget(self.progress_bar)
+        self.time_label = QLabel("00:00 / 00:00"); layout.addWidget(self.time_label)
+        
+        self.stats_label = QLabel("People: 0 | Latency: 0ms"); layout.addWidget(self.stats_label)
         self.setLayout(layout)
         
+        self.is_playing = True
         self.load_model(self.combo.currentText())
-        self.cap = cv2.VideoCapture(VIDEO_PATH)
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.process_frame)
-        self.timer.start(1)
+        self.timer = QTimer(); self.timer.timeout.connect(self.process_frame); self.timer.start(1)
+
+    def toggle_play(self): self.is_playing = not self.is_playing
+    def reset_video(self): self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     def load_model(self, name):
         init_default_scope('mmpose')
@@ -72,41 +79,29 @@ class PoseApp(QWidget):
         self.visualizer.set_dataset_meta(self.pose_model.dataset_meta)
 
     def process_frame(self):
+        if not self.is_playing: return
         ret, frame = self.cap.read()
         if not ret: self.timer.stop(); return
         
+        current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
         start = time.time()
 
-        # 1. Detection
-        init_default_scope('mmdet') 
-        det_result = inference_detector(self.detector, frame)
-        init_default_scope('mmpose')
-        
-        pred_instances = det_result.pred_instances
-        bboxes = pred_instances.bboxes[pred_instances.scores > 0.5].cpu().numpy()
-        
-        # 2. Pose Estimation
+        init_default_scope('mmdet'); det_result = inference_detector(self.detector, frame); init_default_scope('mmpose')
+        bboxes = det_result.pred_instances.bboxes[det_result.pred_instances.scores > 0.5].cpu().numpy()
         pose_results = inference_topdown(self.pose_model, frame, bboxes)
         
-        # 3. Visualization
-        if len(pose_results) > 0:
-            merged_results = merge_data_samples(pose_results)
-            vis_frame = self.visualizer.add_datasample(
-                'result', frame, merged_results, 
-                draw_gt=False, draw_bbox=True, show=False
-            )
-        else:
-            vis_frame = frame
+        merged = merge_data_samples(pose_results) if len(pose_results) > 0 else frame
+        vis = self.visualizer.add_datasample('res', frame, merged, draw_gt=False, show=False)
         
-        # 4. Display
-        vis_frame = cv2.cvtColor(vis_frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = vis_frame.shape
-        qt_img = QImage(vis_frame.data, w, h, ch * w, QImage.Format.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(qt_img).scaled(800, 600, Qt.AspectRatioMode.KeepAspectRatio))
+        # Display
+        vis = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        self.video_label.setPixmap(QPixmap.fromImage(QImage(vis.data, vis.shape[1], vis.shape[0], vis.shape[1]*3, QImage.Format.Format_RGB888)).scaled(800, 600, Qt.AspectRatioMode.KeepAspectRatio))
         
-        # 5. Update Stats Label
-        elapsed = (time.time() - start) * 1000
-        self.stats_label.setText(f"People Detected: {len(pose_results)} | Processing Latency: {elapsed:.1f} ms")
+        # Update Controls
+        self.progress_bar.setValue(current_frame)
+        def format_time(f): return f"{int(f/self.fps)//60:02d}:{int(f/self.fps)%60:02d}"
+        self.time_label.setText(f"{format_time(current_frame)} / {format_time(self.total_frames)}")
+        self.stats_label.setText(f"People Detected: {len(pose_results)} | Processing: {(time.time()-start)*1000:.1f}ms")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
